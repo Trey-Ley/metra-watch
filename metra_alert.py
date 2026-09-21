@@ -62,7 +62,9 @@ def load_static():
         if name not in names:
             return []
         with z.open(name) as f:
-            return list(csv.DictReader(io.TextIOWrapper(f, "utf-8-sig")))
+            rows = csv.DictReader(io.TextIOWrapper(f, "utf-8-sig"), skipinitialspace=True)
+            # Metra's files have stray spaces/odd casing in headers and values; normalize them.
+            return [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items()} for r in rows]
 
     return {n: read(n) for n in
             ["trips.txt", "stops.txt", "stop_times.txt", "calendar.txt", "calendar_dates.txt"]}
@@ -70,11 +72,11 @@ def load_static():
 
 def active_services(g, day):
     ymd, dow = day.strftime("%Y%m%d"), day.strftime("%A").lower()
-    active = {c["service_id"] for c in g["calendar.txt"]
-              if c["start_date"] <= ymd <= c["end_date"] and c.get(dow) == "1"}
+    active = {c.get("service_id") for c in g["calendar.txt"]
+              if c.get("start_date", "0") <= ymd <= c.get("end_date", "99999999") and c.get(dow) == "1"}
     for cd in g["calendar_dates.txt"]:
-        if cd["date"] == ymd:
-            if cd["exception_type"] == "1":
+        if cd.get("date") == ymd:
+            if cd.get("exception_type") == "1":
                 active.add(cd["service_id"])
             else:
                 active.discard(cd["service_id"])
@@ -83,11 +85,19 @@ def active_services(g, day):
 
 def find_trip(g, day):
     services = active_services(g, day)
-    for t in g["trips.txt"]:
-        if t["service_id"] not in services or "BNSF" not in t["route_id"].upper():
-            continue
-        if TRAIN_PAT.search(t["trip_id"]) or TRAIN_PAT.search(t.get("trip_short_name", "")):
+    candidates = [t for t in g["trips.txt"]
+                  if "BNSF" in t.get("route_id", "").upper()
+                  and (TRAIN_PAT.search(t.get("trip_id", "")) or TRAIN_PAT.search(t.get("trip_short_name", "")))]
+    for t in candidates:
+        if t.get("service_id") in services:
             return t
+    if candidates and not services:
+        # Calendar couldn't be read; fall back to the train number alone (weekday-only train).
+        log("Warning: couldn't read Metra's service calendar; matching on train number only.")
+        return candidates[0]
+    if not candidates:
+        log(f"No BNSF trip with number {TRAIN} in the schedule. Sample BNSF trip IDs:",
+            [t.get("trip_id") for t in g["trips.txt"] if "BNSF" in t.get("route_id", "").upper()][:5])
     return None
 
 
@@ -236,14 +246,14 @@ def send_sms(body, dry=False):
         return
     provider = os.getenv("SMS_PROVIDER", "email").lower()
     if provider == "email":
-        sender = os.environ["GMAIL_ADDRESS"]
+        sender = os.environ["GMAIL_ADDRESS"].strip()
         msg = EmailMessage()
         msg["From"] = sender
         msg["To"] = os.getenv("EMAIL_TO") or sender
         msg["Subject"] = body.splitlines()[0] if "\n" not in body else body.splitlines()[1]
         msg.set_content(body)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
-            smtp.login(sender, os.environ["GMAIL_APP_PASSWORD"])
+            smtp.login(sender, re.sub(r"\s", "", os.environ["GMAIL_APP_PASSWORD"]))
             smtp.send_message(msg)
     elif provider == "twilio":
         sid, token = os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]
@@ -301,7 +311,7 @@ def main():
     args = ap.parse_args()
 
     if args.test_sms:
-        send_sms(f"✅ Test from your Metra #{TRAIN} watcher. Texts are working!")
+        send_sms(f"✅ Test from your Metra #{TRAIN} watcher. Alerts are working!")
         return
 
     now = datetime.now(TZ)
