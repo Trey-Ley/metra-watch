@@ -1,0 +1,48 @@
+name: Metra train watcher
+
+on:
+  schedule:
+    # Both fire at 6:05 AM Chicago time (one for daylight time, one for standard time).
+    # The script only proceeds on the one matching today's clock.
+    - cron: "5 11 * * 1-5"
+    - cron: "5 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        default: dry-run
+        options: [dry-run, test-sms, live]  # test-sms sends a test alert
+
+concurrency:
+  group: metra-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Watch train
+        env:
+          METRA_API_KEY: ${{ secrets.METRA_API_KEY }}
+          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+          SMS_PROVIDER: ${{ vars.SMS_PROVIDER || 'email' }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TEXTBELT_KEY: ${{ secrets.TEXTBELT_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          TRIGGER_CRON: ${{ github.event.schedule }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          if [ "$MODE" = "dry-run" ]; then python metra_alert.py --dry-run
+          elif [ "$MODE" = "test-sms" ]; then python metra_alert.py --test-sms
+          else python metra_alert.py; fi
