@@ -250,7 +250,10 @@ def send_sms(body, dry=False):
         msg = EmailMessage()
         msg["From"] = sender
         msg["To"] = os.getenv("EMAIL_TO") or sender
-        msg["Subject"] = body.splitlines()[0] if "\n" not in body else body.splitlines()[1]
+        lines = body.splitlines()
+        # For the "just left Aurora" alert, the expected-arrival line is the most useful subject.
+        msg["Subject"] = (("[Dry run] " if body.startswith("[Dry run]") else "") + lines[1]
+                          if "🚆" in lines[0] and len(lines) > 1 else lines[0])
         msg.set_content(body)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
             smtp.login(sender, re.sub(r"\s", "", os.environ["GMAIL_APP_PASSWORD"]))
@@ -328,7 +331,7 @@ def main():
     g = load_static()
     trip = find_trip(g, today)
     if trip is None:
-        log(f"Train #{TRAIN} is not scheduled today (holiday or schedule change). Exiting.")
+        send_sms(f"ℹ️ BNSF #{TRAIN} is not scheduled today (holiday or schedule change). No train to watch.")
         return
     trip_id = trip["trip_id"]
     sts, watch, mine = trip_stops(g, trip_id)
@@ -344,7 +347,12 @@ def main():
         log("Live trip update found:", tu is not None, "| GPS position found:", vp is not None)
         if tu is not None or vp is not None:
             log(f"Has left {WATCH_STOP}:", has_left(watch, sts, tu, vp, datetime.now(TZ)))
-        send_sms(build_message(trip_id, sts, mine, tu, today), dry=True)
+        if tu is None and vp is None:
+            body = (f"No live tracking for BNSF #{TRAIN} right now (normal outside commute hours).\n"
+                    f"Scheduled: {WATCH_STOP} {fmt(sched_watch)}, {MY_STOP} {fmt(sched_mine)}.")
+        else:
+            body = build_message(trip_id, sts, mine, tu, today)
+        send_sms("[Dry run] " + body)
         return
 
     start = sched_watch - timedelta(minutes=15)
@@ -381,8 +389,18 @@ def main():
 
         time.sleep(POLL_SECONDS)
 
-    log("Train never reported leaving the watch stop. No text sent.")
+    send_sms(f"⚠️ BNSF #{TRAIN} never reported leaving {WATCH_STOP} by {fmt(deadline)}. "
+             f"Check metra.com for its status.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Always email, even when something breaks.
+        try:
+            send_sms(f"⚠️ Metra #{TRAIN} watcher hit an error and couldn't track the train today: "
+                     f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise
