@@ -37,6 +37,8 @@ MY_STOP = os.getenv("MY_STOP", "Lisle")          # the station you board at
 DELAY_THRESHOLD_MIN = int(os.getenv("DELAY_THRESHOLD_MIN", "5"))
 POLL_SECONDS = 30                                # Metra updates every 30 s
 NO_DATA_GRACE_MIN = 10                           # after this, assume "on schedule"
+# Stops between Aurora and Lisle where you get an update email ONLY if the train is running late
+CHECKPOINTS = [c.strip() for c in os.getenv("CHECKPOINTS", "Route 59,Naperville").split(",") if c.strip()]
 
 STATIC_URL = "https://schedules.metrarail.com/gtfs/schedule.zip"
 RT_BASE = "https://gtfspublic.metrarr.com/gtfs/public"
@@ -113,7 +115,15 @@ def trip_stops(g, trip_id):
                 return st
         return None
 
-    return sts, find(WATCH_STOP), find(MY_STOP)
+    watch, mine = find(WATCH_STOP), find(MY_STOP)
+    checkpoints = []
+    for label in CHECKPOINTS:
+        st = find(label) or find(label.replace("Route", "Rt"))
+        if st and watch and mine and int(watch["stop_sequence"]) < int(st["stop_sequence"]) < int(mine["stop_sequence"]):
+            checkpoints.append((label, st))
+        else:
+            log(f"Warning: checkpoint '{label}' not found between {WATCH_STOP} and {MY_STOP}; skipping it.")
+    return sts, watch, mine, checkpoints
 
 
 def gtfs_time(day, hhmmss):
@@ -174,10 +184,10 @@ def has_left(stop, sts, tu, vp, now):
 
 
 def expected_arrival(stop, sts, tu, day):
-    """(scheduled, expected) arrival at `stop`."""
+    """(scheduled, expected, is_live) arrival at `stop`."""
     sched = gtfs_time(day, stop["arrival_time"])
     if tu is None:
-        return sched, sched
+        return sched, sched, False
     seq_of = {st["stop_id"]: int(st["stop_sequence"]) for st in sts}
     by_seq = {int(st["stop_sequence"]): st for st in sts}
     my_seq = int(stop["stop_sequence"])
@@ -187,11 +197,11 @@ def expected_arrival(stop, sts, tu, day):
         ev = u.arrival if u.HasField("arrival") else u.departure
         if seq == my_seq:
             if u.schedule_relationship == rt.TripUpdate.StopTimeUpdate.SKIPPED:
-                return sched, None
+                return sched, None, True
             if ev.time:
-                return sched, datetime.fromtimestamp(ev.time, TZ)
+                return sched, datetime.fromtimestamp(ev.time, TZ), True
             if ev.HasField("delay"):
-                return sched, sched + timedelta(seconds=ev.delay)
+                return sched, sched + timedelta(seconds=ev.delay), True
         if seq and seq < my_seq:
             if ev.HasField("delay"):
                 last_delay = ev.delay
@@ -199,10 +209,10 @@ def expected_arrival(stop, sts, tu, day):
                 ref = by_seq[seq]
                 last_delay = ev.time - gtfs_time(day, ref["arrival_time"]).timestamp()
     if last_delay is not None:  # carry the most recent known delay forward
-        return sched, sched + timedelta(seconds=last_delay)
+        return sched, sched + timedelta(seconds=last_delay), True
     if tu.HasField("delay"):
-        return sched, sched + timedelta(seconds=tu.delay)
-    return sched, sched
+        return sched, sched + timedelta(seconds=tu.delay), True
+    return sched, sched, False
 
 
 def delay_reason(trip_id):
@@ -252,7 +262,8 @@ def send_sms(body, dry=False):
         msg["To"] = os.getenv("EMAIL_TO") or sender
         lines = body.splitlines()
         # For the "just left Aurora" alert, the expected-arrival line is the most useful subject.
-        msg["Subject"] = (("[Dry run] " if body.startswith("[Dry run]") else "") + lines[1]
+        msg["Subject"] = (("[Dry run] " if body.startswith("[Dry run]") else "")
+                          + ("UPDATE: " if "UPDATE" in lines[0] else "") + lines[1]
                           if "🚆" in lines[0] and len(lines) > 1 else lines[0])
         msg.set_content(body)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
@@ -274,25 +285,33 @@ def send_sms(body, dry=False):
     log("Alert sent.")
 
 
-def build_message(trip_id, sts, my_stop, tu, day):
-    sched, exp = expected_arrival(my_stop, sts, tu, day)
-    if exp is None:
-        msg = f"⚠️ BNSF #{TRAIN} left {WATCH_STOP} but Metra shows it SKIPPING {MY_STOP} today."
-        reason = delay_reason(trip_id)
-        return msg + (f"\nReason: {reason}" if reason else "")
+def status_text(sched, exp):
     late = round((exp - sched).total_seconds() / 60)
     if late > 0:
-        status = f"{late} min late"
-    elif late < 0:
-        status = f"{-late} min early"
+        return late, f"{late} min late"
+    if late < 0:
+        return late, f"{-late} min early"
+    return late, "on time"
+
+
+def build_message(trip_id, sts, my_stop, tu, day, checkpoint=None):
+    sched, exp, live = expected_arrival(my_stop, sts, tu, day)
+    if exp is None:
+        msg = f"⚠️ BNSF #{TRAIN} is now shown SKIPPING {MY_STOP} today."
+        reason = delay_reason(trip_id)
+        return msg + (f"\nReason: {reason}" if reason else ""), None
+    late, status = status_text(sched, exp)
+    if checkpoint is None:
+        head = f"🚆 BNSF #{TRAIN} just left {WATCH_STOP}."
     else:
-        status = "on time"
-    msg = (f"🚆 BNSF #{TRAIN} just left {WATCH_STOP}.\n"
-           f"Expected at {MY_STOP}: {fmt(exp)} (scheduled {fmt(sched)}, {status}).")
+        head = f"🚆 UPDATE: BNSF #{TRAIN} left {checkpoint} running {status}."
+    msg = f"{head}\nExpected at {MY_STOP}: {fmt(exp)} (scheduled {fmt(sched)}, {status})."
+    msg += ("\nSource: Metra live prediction." if live else
+            "\nSource: SCHEDULE ONLY. Metra isn't publishing a live prediction for this train right now.")
     if late > DELAY_THRESHOLD_MIN:
         reason = delay_reason(trip_id)
         msg += f"\nLikely reason: {reason}" if reason else "\nMetra hasn't posted a reason yet."
-    return msg
+    return msg, exp
 
 
 # ---------------------------------------------------------------- main
@@ -334,7 +353,7 @@ def main():
         send_sms(f"ℹ️ BNSF #{TRAIN} is not scheduled today (holiday or schedule change). No train to watch.")
         return
     trip_id = trip["trip_id"]
-    sts, watch, mine = trip_stops(g, trip_id)
+    sts, watch, mine, checkpoints = trip_stops(g, trip_id)
     if not watch or not mine:
         sys.exit(f"Couldn't find '{WATCH_STOP}' or '{MY_STOP}' on trip {trip_id}.")
 
@@ -351,7 +370,7 @@ def main():
             body = (f"No live tracking for BNSF #{TRAIN} right now (normal outside commute hours).\n"
                     f"Scheduled: {WATCH_STOP} {fmt(sched_watch)}, {MY_STOP} {fmt(sched_mine)}.")
         else:
-            body = build_message(trip_id, sts, mine, tu, today)
+            body, _ = build_message(trip_id, sts, mine, tu, today)
         send_sms("[Dry run] " + body)
         return
 
@@ -361,8 +380,9 @@ def main():
         log(f"Sleeping until {fmt(start)}...")
         time.sleep(wait)
 
-    deadline = sched_mine + timedelta(minutes=60)
+    deadline = sched_mine + timedelta(minutes=90)
     no_data_deadline = sched_watch + timedelta(minutes=NO_DATA_GRACE_MIN)
+    last_sent = None  # expected Lisle time we last emailed
     while datetime.now(TZ) < deadline:
         now = datetime.now(TZ)
         try:
@@ -372,25 +392,52 @@ def main():
             time.sleep(POLL_SECONDS)
             continue
 
+        # Audit trail: every poll is written to the GitHub log
+        _, exp, live = expected_arrival(mine, sts, tu, today)
+        pos = (f"stop_seq={vp.current_stop_sequence} status={rt.VehiclePosition.VehicleStopStatus.Name(vp.current_status)}"
+               if vp is not None else "no GPS")
+        log(f"live_update={'yes' if tu is not None else 'no'} | {pos} | "
+            f"{MY_STOP} ETA={fmt(exp) if exp else 'SKIPPED'} ({'live' if live else 'schedule'})")
+
         if tu is not None and tu.trip.schedule_relationship == rt.TripDescriptor.CANCELED:
             reason = delay_reason(trip_id)
             send_sms(f"❌ Metra shows BNSF #{TRAIN} CANCELED today."
                      + (f"\nReason: {reason}" if reason else ""))
             return
 
-        if has_left(watch, sts, tu, vp, now):
-            send_sms(build_message(trip_id, sts, mine, tu, today))
-            return
-
-        if tu is None and vp is None and now > no_data_deadline:
-            send_sms(f"ℹ️ No live tracking for BNSF #{TRAIN} right now. Metra treats that as "
-                     f"on schedule: {MY_STOP} at {fmt(sched_mine)}.")
-            return
+        if last_sent is None:
+            if has_left(watch, sts, tu, vp, now):
+                body, last_sent = build_message(trip_id, sts, mine, tu, today)
+                send_sms(body)
+                if last_sent is None:  # skipping Lisle; nothing more to track
+                    return
+            elif tu is None and vp is None and now > no_data_deadline:
+                send_sms(f"ℹ️ No live tracking for BNSF #{TRAIN} right now. Metra treats that as "
+                         f"on schedule: {MY_STOP} at {fmt(sched_mine)}.")
+                return
+        else:
+            # Already emailed at Aurora: check each checkpoint as the train leaves it.
+            if has_left(mine, sts, tu, vp, now):
+                log(f"Train has left {MY_STOP}. Done.")
+                return
+            if exp is None:
+                body, _ = build_message(trip_id, sts, mine, tu, today)
+                send_sms(body)
+                return
+            while checkpoints and has_left(checkpoints[0][1], sts, tu, vp, now):
+                label, _ = checkpoints.pop(0)
+                late, status = status_text(gtfs_time(today, mine["arrival_time"]), exp)
+                if live and late > DELAY_THRESHOLD_MIN:
+                    body, _ = build_message(trip_id, sts, mine, tu, today, checkpoint=label)
+                    send_sms(body)
+                else:
+                    log(f"Left {label} {status} ({'live' if live else 'schedule'}): no update email needed.")
 
         time.sleep(POLL_SECONDS)
 
-    send_sms(f"⚠️ BNSF #{TRAIN} never reported leaving {WATCH_STOP} by {fmt(deadline)}. "
-             f"Check metra.com for its status.")
+    if last_sent is None:
+        send_sms(f"⚠️ BNSF #{TRAIN} never reported leaving {WATCH_STOP} by {fmt(deadline)}. "
+                 f"Check metra.com for its status.")
 
 
 if __name__ == "__main__":
